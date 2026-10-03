@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 
 import { type SshAuthOptions, isSshAuthFailure } from "./auth.ts";
 import { runSshCommand, type RunSshCommandOptions } from "./command.ts";
+import { SshCommandError } from "./errors.ts";
 
 export type RemoteShell = "posix" | "powershell";
 
@@ -69,14 +70,59 @@ export const detectRemoteShell = Effect.fn("ssh/detectRemoteShell")(function* (
   if (uname.stdout.split(/\r?\n/u).some((line) => ["Linux", "Darwin"].includes(line.trim()))) {
     return "posix" as const;
   }
+  return (yield* isWindowsHost(target, auth)) ? ("powershell" as const) : ("posix" as const);
+});
+
+const isWindowsHost = Effect.fn("ssh/isWindowsHost")(function* (
+  target: DesktopSshEnvironmentTarget,
+  auth: SshAuthOptions,
+) {
   const windows = yield* probeRemoteShell(target, {
     ...auth,
     ...powerShellCommand(
       "if ($env:OS -eq 'Windows_NT') { Write-Output 'T3_SSH_WINDOWS' } else { exit 1 }",
     ),
   });
-  // Anything else gets the POSIX script, which names unsupported platforms itself.
-  return windows.stdout.split(/\r?\n/u).some((line) => line.trim() === "T3_SSH_WINDOWS")
-    ? ("powershell" as const)
-    : ("posix" as const);
+  return windows.stdout.split(/\r?\n/u).some((line) => line.trim() === "T3_SSH_WINDOWS");
+});
+
+const POSIX_STARTED = "T3_SSH_POSIX_STARTED\n";
+
+/** Runs the POSIX bootstrap in the first connection; undefined selects a confirmed Windows host. */
+export const tryPosixCommand = Effect.fn("ssh/tryPosixCommand")(function* (
+  target: DesktopSshEnvironmentTarget,
+  input: RunSshCommandOptions & { readonly stdin: string },
+) {
+  // Check before the bootstrap can create files or processes. Git Bash also
+  // has sh, but must take the native Windows path; WSL must stay on POSIX.
+  const guard = String.raw`case "$(uname -s)" in
+  Linux|Darwin) ;;
+  *) printf '%s\n' 'Unsupported remote platform for T3 SSH.' >&2; exit 1 ;;
+esac
+printf '%s\n' 'T3_SSH_POSIX_STARTED' >&2
+`;
+  return yield* runSshCommand(target, { ...input, stdin: guard + input.stdin }).pipe(
+    Effect.catchTag("SshCommandError", (error) =>
+      Effect.gen(function* () {
+        // Once the bootstrap started, its failure must never trigger another
+        // launch. Keep authentication/transport failures on their existing path.
+        if (error.stderr.includes(POSIX_STARTED)) {
+          const stderr = error.stderr.replace(POSIX_STARTED, "");
+          return yield* new SshCommandError({
+            ...error,
+            stderr,
+            message:
+              stderr.trim() ||
+              error.stdout?.trim() ||
+              `Remote POSIX bootstrap failed (exit ${error.exitCode}).`,
+          });
+        }
+        if (error.exitCode === null || error.exitCode === 255 || isSshAuthFailure(error)) {
+          return yield* error;
+        }
+        if (yield* isWindowsHost(target, input)) return undefined;
+        return yield* error;
+      }),
+    ),
+  );
 });

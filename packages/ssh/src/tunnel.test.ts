@@ -502,7 +502,7 @@ describe("ssh tunnel scripts", () => {
         Effect.sync(() => {
           const args = commandArgs(command);
           spawnedCommands.push(args);
-          if (args.includes("uname")) return makeSuccessfulProcess("Linux");
+          assert.notInclude(args, "uname");
           if (args.includes("-N")) {
             return makeRunningProcess(() => {
               tunnelKillCount += 1;
@@ -547,6 +547,8 @@ describe("ssh tunnel scripts", () => {
 
         const first = yield* manager.ensureEnvironment(target);
         assert.equal(first.httpBaseUrl, "http://127.0.0.1:41773/");
+        // One bootstrap connection plus the tunnel; no separate shell probe.
+        assert.equal(spawnedCommands.filter((args) => !args.includes("-G")).length, 2);
         const firstTunnelArgs = spawnedCommands.find((args) => args.includes("-N"));
         assert.isDefined(firstTunnelArgs);
         assert.include(firstTunnelArgs, "ControlMaster=no");
@@ -612,7 +614,7 @@ describe("ssh tunnel scripts", () => {
           Effect.gen(function* () {
             const args = commandArgs(command);
             const isTarget = args.includes(target.alias);
-            if (args.includes("uname")) return makeSuccessfulProcess("Linux");
+            assert.notInclude(args, "uname");
             if (args.includes("-G")) {
               if (isTarget && ++resolutions === 4) {
                 yield* Deferred.succeed(reconnectsStarted, undefined);
@@ -710,7 +712,13 @@ describe("ssh tunnel scripts", () => {
           return makeRunningProcess(() => {
             tunnelsStopped += 1;
           });
-        if (args.includes("uname")) return makeSuccessfulProcess("MINGW64_NT-10.0");
+        assert.notInclude(args, "uname");
+        if (args.includes("sh"))
+          return {
+            ...makeSuccessfulProcess(""),
+            stderr: Stream.make(new TextEncoder().encode("sh is not recognized")),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+          };
         assert.include(args, "powershell.exe");
         assert.notInclude(args, "sh");
         const stdin = command._tag === "StandardCommand" ? command.options.stdin : undefined;

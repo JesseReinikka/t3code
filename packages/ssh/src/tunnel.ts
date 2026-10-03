@@ -65,7 +65,12 @@ import {
   resolveRemoteRunner,
   type RemoteT3RunnerOptions,
 } from "./remoteRunner.ts";
-import { detectRemoteShell, powerShellCommand, type RemoteShell } from "./remoteShell.ts";
+import {
+  detectRemoteShell,
+  powerShellCommand,
+  tryPosixCommand,
+  type RemoteShell,
+} from "./remoteShell.ts";
 import { buildWindowsRemoteScript, WINDOWS_STOP_TIMEOUT_MS } from "./windowsRemote.ts";
 
 export {
@@ -812,7 +817,7 @@ function remoteServerCommand(
   target: DesktopSshEnvironmentTarget,
   operation: RemoteServerOperation,
   runner?: RemoteT3RunnerOptions,
-): Pick<RunSshCommandOptions, "remoteCommandArgs" | "stdin" | "timeoutMs"> {
+): Pick<RunSshCommandOptions, "remoteCommandArgs" | "timeoutMs"> & { readonly stdin: string } {
   if (remoteShell === "powershell") {
     return {
       ...powerShellCommand(buildWindowsRemoteScript(remoteStateKey(target), operation, runner)),
@@ -839,9 +844,13 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
     target: DesktopSshEnvironmentTarget,
     input: SshAuthOptions | undefined,
     runner: RemoteT3RunnerOptions | undefined,
-    remoteShell: RemoteShell,
+    remoteShell: RemoteShell | undefined,
   ): Effect.fn.Return<
-    { readonly remotePort: number; readonly remoteServerKind: "external" | "managed" | null },
+    {
+      readonly remotePort: number;
+      readonly remoteServerKind: "external" | "managed" | null;
+      readonly remoteShell: RemoteShell;
+    },
     SshCommandError | SshInvalidTargetError | SshLaunchError,
     ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
   > {
@@ -850,14 +859,22 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
       ...sshRunnerLogFields(runner),
       stateKey: remoteStateKey(target),
     });
-    const result = yield* runSshCommand(target, {
-      ...remoteServerCommand(remoteShell, target, "launch", runner),
+    const commandOptions = {
       timeoutMs: isNodeScriptRunner(runner)
         ? REMOTE_LAUNCH_TIMEOUT_MS
         : REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS,
-      ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
-      ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
-      ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
+      ...input,
+    };
+    let shell = remoteShell;
+    let result;
+    if (shell === undefined) {
+      const posix = remoteServerCommand("posix", target, "launch", runner);
+      result = yield* tryPosixCommand(target, { ...posix, ...commandOptions });
+      shell = result === undefined ? "powershell" : "posix";
+    }
+    result ??= yield* runSshCommand(target, {
+      ...remoteServerCommand(shell, target, "launch", runner),
+      ...commandOptions,
     });
     if (!getLastNonEmptyOutputLine(result.stdout)) {
       return yield* new SshLaunchError({
@@ -890,6 +907,7 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
     return {
       remotePort: parsed.remotePort,
       remoteServerKind: parsed.serverKind ?? null,
+      remoteShell: shell,
     };
   },
 );
@@ -1487,13 +1505,15 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       ...sshRunnerLogFields(input.runner),
       key: input.key,
     });
-    const remoteShell = yield* resolveRemoteShell(input.key, input.resolvedTarget);
+    const knownShell = remoteShells.get(input.key);
     const remoteLaunch = yield* runWithSshAuth({
       key: input.key,
       target: input.resolvedTarget,
       operation: (authOptions) =>
-        launchOrReuseRemoteServer(input.resolvedTarget, authOptions, input.runner, remoteShell),
+        launchOrReuseRemoteServer(input.resolvedTarget, authOptions, input.runner, knownShell),
     });
+    const remoteShell = remoteLaunch.remoteShell;
+    remoteShells.set(input.key, remoteShell);
     const remotePort = remoteLaunch.remotePort;
     yield* Effect.logDebug("ssh.environment.remotePort.ready", {
       ...sshTargetLogFields(input.resolvedTarget),
