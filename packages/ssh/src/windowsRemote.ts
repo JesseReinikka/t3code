@@ -14,7 +14,7 @@ import { resolveRemoteRunner, type RemoteT3RunnerOptions } from "./remoteRunner.
 
 type WindowsRemoteOperation = "launch" | "pair" | "stop" | "logs";
 
-// Launch, stop, and launch cleanup wait this long on the connection launch lock.
+// Launch, stop, and launch cleanup wait this long on the shared launch lock.
 const WINDOWS_LOCK_WAIT_SECONDS = 90;
 /** Stop may wait out the launch lock before killing the owned process tree. */
 export const WINDOWS_STOP_TIMEOUT_MS = (WINDOWS_LOCK_WAIT_SECONDS + 10) * 1000;
@@ -122,6 +122,7 @@ $StateDir = Join-Path $T3Home ('ssh-launch/' + $Config.stateKey)
 $OwnerFile = Join-Path $StateDir 'owner.json'
 $LauncherFile = Join-Path $StateDir 'launcher.json'
 $StopFile = Join-Path $StateDir 'stop-pending.json'
+$PendingFile = Join-Path $T3Home 'ssh-launch/windows-pending.json'
 $PortFile = Join-Path $StateDir 'port'
 $LogFile = Join-Path $StateDir 'server.log'
 $ErrorLogFile = Join-Path $StateDir 'server.err.log'
@@ -133,6 +134,10 @@ ${PROCESS_OWNERSHIP}
 function Stop-OwnedServer {
   $launcher = Read-Owner $LauncherFile
   Stop-ProcessTrees @($launcher, (Read-Owner))
+  $pending = Read-Owner $PendingFile
+  if ($launcher -and $pending -and $pending.token -eq $launcher.token) {
+    Remove-Item -LiteralPath $PendingFile -Force
+  }
   Remove-Item -LiteralPath $StopFile, $LauncherFile, $OwnerFile, $PortFile -Force -ErrorAction SilentlyContinue
 }
 
@@ -219,11 +224,11 @@ const LAUNCH = String.raw`
 function Open-LaunchLock {
   $deadline = [DateTime]::UtcNow.AddSeconds($Config.lockWaitSeconds)
   while ($true) {
-    $lock = Open-Lock (Join-Path $StateDir 'launch.lock') $Config.lockWaitSeconds
-    $pending = Read-Owner $LauncherFile
+    $lock = Open-Lock (Join-Path $T3Home 'ssh-launch/windows.lock') $Config.lockWaitSeconds
+    $pending = Read-Owner $PendingFile
     if (-not (Get-OwnedProcess $pending)) { return $lock }
-    # Let this connection's registered launcher finish before another
-    # bootstrap reads or replaces its ownership and port files.
+    # Let the registered launcher acquire this lock before another bootstrap
+    # picks a port. The registration is shared across aliases of this home.
     $lock.Dispose()
     if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for the pending Windows SSH launch.' }
     Start-Sleep -Milliseconds 100
@@ -260,10 +265,11 @@ $errorFile = Join-Path $config.state 'launch-error'
 $server = $null
 $ready = $false
 $registered = $false
+$pendingFile = Join-Path $config.home 'ssh-launch/windows-pending.json'
 try {
   # The bootstrap registers this launcher while holding the same lock. If it
   # dies before registration, or stop wins the lock, this launch is cancelled.
-  $lockPath = Join-Path $config.state 'launch.lock'
+  $lockPath = Join-Path $config.home 'ssh-launch/windows.lock'
   $deadline = [DateTime]::UtcNow.AddSeconds($config.lockWaitSeconds)
   $launchLock = $null
   while (-not $launchLock) {
@@ -278,6 +284,9 @@ try {
     if (-not (Test-Path -LiteralPath $permitFile)) { return }
     $permit = [IO.File]::ReadAllText($permitFile) | ConvertFrom-Json
     if ($permit.token -ne $config.token -or $permit.pid -ne $PID) { return }
+    if (-not (Test-Path -LiteralPath $pendingFile)) { return }
+    $pending = [IO.File]::ReadAllText($pendingFile) | ConvertFrom-Json
+    if ($pending.token -ne $config.token) { return }
     $registered = $true
     $arguments = 'serve --host 127.0.0.1 --port ' + $config.port + ' --base-dir "' + $config.home + '"'
     $server = Start-Process -FilePath $config.executable -ArgumentList $arguments -WorkingDirectory $config.home -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $config.state 'server.log') -RedirectStandardError (Join-Path $config.state 'server.err.log')
@@ -288,11 +297,26 @@ try {
     $owner = $serverOwner | ConvertTo-Json -Compress
     [IO.File]::WriteAllText(($ownerFile + '.next'), $owner, $utf8)
     Move-Item -LiteralPath ($ownerFile + '.next') -Destination $ownerFile -Force
+    $runtimeDeadline = [DateTime]::UtcNow.AddMilliseconds($config.readyTimeoutMs)
     Invoke-Native $config.executable @('__ssh-helper', 'wait-ready', $config.port, $config.readyTimeoutMs, $config.readyProbeTimeoutMs) | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Remote T3 server did not become ready.' }
+    # HTTP can answer before the discovery record is published. Keep aliases
+    # serialized until they can discover this exact server through its home.
+    $runtimeFile = Join-Path $config.home 'userdata/server-runtime.json'
+    while ($true) {
+      $runtime = Invoke-Native $config.executable @('__ssh-helper', 'runtime-port', $runtimeFile)
+      if ($LASTEXITCODE -eq 0 -and $runtime -eq ("$($server.Id) $($config.port)")) { break }
+      if ($server.HasExited) { throw 'Remote T3 server exited before publishing its runtime record.' }
+      if ([DateTime]::UtcNow -ge $runtimeDeadline) { throw 'Remote T3 server did not publish its runtime record.' }
+      Start-Sleep -Milliseconds 100
+    }
     $ready = $true
   } finally {
     try {
+      if ($registered -and (Test-Path -LiteralPath $pendingFile)) {
+        $pending = [IO.File]::ReadAllText($pendingFile) | ConvertFrom-Json
+        if ($pending.token -eq $config.token) { Remove-Item -LiteralPath $pendingFile -Force }
+      }
       # Stop owns only the server after readiness; the launcher now exits.
       if ($ready) { Remove-Item -LiteralPath $permitFile -Force }
     } catch {
@@ -337,6 +361,8 @@ try {
   try {
     [IO.File]::WriteAllText(($LauncherFile + '.next'), ($registration | ConvertTo-Json -Compress), $Utf8)
     Move-Item -LiteralPath ($LauncherFile + '.next') -Destination $LauncherFile -Force
+    [IO.File]::WriteAllText(($PendingFile + '.next'), ($registration | ConvertTo-Json -Compress), $Utf8)
+    Move-Item -LiteralPath ($PendingFile + '.next') -Destination $PendingFile -Force
   } catch {
     Invoke-Native (Join-Path $env:SystemRoot 'System32/taskkill.exe') @('/PID', $launcherProcess.Id, '/T', '/F') | Out-Null
     throw
@@ -359,8 +385,8 @@ function Wait-Server($Launch) {
 
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $Executable = Install-Runtime
-# Serialize this connection's launch, stop, and cleanup operations, including
-# the detached launcher that can outlive its bootstrap SSH connection.
+# Serialize across aliases/clients sharing the default server home, including
+# disconnects, so a second launch observes the first server's runtime record.
 $launchLock = Open-LaunchLock
 try {
   $owner = Read-Owner
@@ -394,7 +420,7 @@ try {
   if (-not (Test-Ready $remotePort $Config.readyTimeoutMs)) {
     throw "Remote T3 server did not become ready on 127.0.0.1:$remotePort."
   }
-  $readyLock = Open-Lock (Join-Path $StateDir 'launch.lock') $Config.lockWaitSeconds
+  $readyLock = Open-Lock (Join-Path $T3Home 'ssh-launch/windows.lock') $Config.lockWaitSeconds
   try {
     $current = Read-Owner
     if (-not $current -or $current.token -ne $launch.token -or -not (Get-OwnedProcess $current)) {
@@ -407,7 +433,7 @@ try {
   } finally { $readyLock.Dispose() }
 } catch {
   $failure = $_
-  $lock = Open-Lock (Join-Path $StateDir 'launch.lock') $Config.lockWaitSeconds
+  $lock = Open-Lock (Join-Path $T3Home 'ssh-launch/windows.lock') $Config.lockWaitSeconds
   try {
     $current = Read-Owner
     if (-not $current) { $current = Read-Owner $LauncherFile }
@@ -423,7 +449,7 @@ try {
 
 const STOP = String.raw`
 if (Test-Path -LiteralPath $StateDir) {
-  $lock = Open-Lock (Join-Path $StateDir 'launch.lock') $Config.lockWaitSeconds
+  $lock = Open-Lock (Join-Path $T3Home 'ssh-launch/windows.lock') $Config.lockWaitSeconds
   try { Stop-OwnedServer } finally { $lock.Dispose() }
 }
 Write-Output '{"stopped":true}'

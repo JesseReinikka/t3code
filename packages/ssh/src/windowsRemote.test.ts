@@ -92,7 +92,12 @@ describe.skipIf(!available || HostProcessPlatform.defaultValue() !== "linux")(
       connectionKey = stateKey,
     ) => {
       stateKeys.add(connectionKey);
-      const script = buildWindowsRemoteScript(connectionKey, operation, options);
+      let script = buildWindowsRemoteScript(connectionKey, operation, options);
+      if (env.T3_FIXTURE_RUNTIME_NEVER) {
+        const headerEnd = script.indexOf("\n") + 1;
+        script =
+          script.slice(0, headerEnd) + "$Config.readyTimeoutMs = 1000\n" + script.slice(headerEnd);
+      }
       const result = await runPowerShell(fixture + script, env);
       try {
         const owner = JSON.parse(
@@ -164,7 +169,7 @@ else if (args[0] === 'serve') {
   const server = http.createServer((req, res) => { res.end('ready'); });
   server.listen(port, '127.0.0.1', () => {
     NodeFSP.mkdirSync(NodePath.join(home, 'userdata'), {recursive: true});
-    NodeFSP.writeFileSync(NodePath.join(home, 'userdata/server-runtime.json'), JSON.stringify({pid: process.pid, port}));
+    if (!process.env.T3_FIXTURE_RUNTIME_NEVER) setTimeout(() => NodeFSP.writeFileSync(NodePath.join(home, 'userdata/server-runtime.json'), JSON.stringify({pid: process.pid, port})), Number(process.env.T3_FIXTURE_RUNTIME_DELAY || 0));
     console.log('fixture server ready');
   });
 }
@@ -358,6 +363,23 @@ function Invoke-CimMethod($ClassName, $MethodName, $Arguments) {
       expect(calls.filter((args) => args[0] === "serve")).toHaveLength(1);
     });
 
+    it("starts only one server when different SSH aliases connect concurrently", async () => {
+      env.T3_FIXTURE_RUNTIME_DELAY = "2000";
+      const results = await Promise.all([
+        runOperation("launch"),
+        runOperation("launch", runner, "fedcba0987654321"),
+      ]);
+      for (const result of results) expect(result.code, result.stderr).toBe(0);
+      const launches = results.map((result) => JSON.parse(result.stdout));
+      expect(launches[0].remotePort).toBe(launches[1].remotePort);
+      expect(launches.map((result) => result.serverKind).sort()).toEqual(["external", "managed"]);
+      const calls = (await NodeFSP.readFile(NodePath.join(root, "calls"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(calls.filter((args) => args[0] === "serve")).toHaveLength(1);
+    });
+
     it("cancels an unregistered launcher when the bootstrap exits", async () => {
       env.T3_FIXTURE_INTERRUPT = "1";
       const interrupted = await runOperation("launch");
@@ -500,6 +522,26 @@ function Invoke-CimMethod($ClassName, $MethodName, $Arguments) {
       await expect(NodeFSP.stat(NodePath.join(state, "stop-pending.json"))).rejects.toMatchObject({
         code: "ENOENT",
       });
+    });
+
+    it("rejects launch and reuse when discovery fails and cleanup cannot stop the server", async () => {
+      env.T3_FIXTURE_RUNTIME_NEVER = "1";
+      env.T3_FIXTURE_KILL_DENIED_ALL = "1";
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const launched = await runOperation("launch");
+          expect(launched.code).toBe(1);
+          expect(launched.stderr).toContain("process tree did not stop");
+          const owner = JSON.parse(
+            await NodeFSP.readFile(NodePath.join(state, "owner.json"), "utf8"),
+          );
+          expect(() => process.kill(owner.pid, 0)).not.toThrow();
+          expect(await NodeFSP.stat(NodePath.join(state, "stop-pending.json"))).toBeDefined();
+        }
+      } finally {
+        delete env.T3_FIXTURE_RUNTIME_NEVER;
+        delete env.T3_FIXTURE_KILL_DENIED_ALL;
+      }
     });
   },
 );
