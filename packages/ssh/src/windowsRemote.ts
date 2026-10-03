@@ -10,7 +10,11 @@ import {
   REMOTE_REUSE_READY_TIMEOUT_MS,
   SSH_READY_PROBE_TIMEOUT_MS,
 } from "./remoteLimits.ts";
-import { resolveRemoteRunner, type RemoteT3RunnerOptions } from "./remoteRunner.ts";
+import {
+  buildRemoteNodeEngineCheckScript,
+  resolveRemoteRunner,
+  type RemoteT3RunnerOptions,
+} from "./remoteRunner.ts";
 
 type WindowsRemoteOperation = "launch" | "pair" | "stop" | "logs";
 
@@ -26,6 +30,10 @@ const INVOKE_NATIVE = String.raw`
 function Invoke-Native([string] $FilePath, [string[]] $Arguments) {
   $ErrorActionPreference = 'Continue'
   & $FilePath @Arguments
+}
+
+function Invoke-Runner($Runner, [string[]] $Arguments) {
+  Invoke-Native $Runner.executable (@($Runner.arguments) + $Arguments)
 }
 `;
 
@@ -220,6 +228,31 @@ function Install-Runtime {
 }
 `;
 
+const RESOLVE_RUNNER = String.raw`
+function Resolve-Runner {
+  if (-not $Config.nodeScriptPath) {
+    return @{ executable = Install-Runtime; arguments = @(); key = $Config.runnerKey }
+  }
+  $node = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $node) { throw 'Remote node.exe was not found on the SSH session PATH.' }
+  if (-not (Test-Path -LiteralPath $Config.nodeScriptPath -PathType Leaf)) {
+    throw "Remote Node script does not exist: $($Config.nodeScriptPath)"
+  }
+  $scriptPath = (Get-Item -LiteralPath $Config.nodeScriptPath).FullName
+  $version = Invoke-Native $node.Path @('--version')
+  if ($LASTEXITCODE -ne 0) { throw "Remote node.exe could not run: $($node.Path)" }
+  if ($Config.nodeEngineRange) {
+    # Base64 carries the shared JavaScript checker through PS 5.1's native
+    # argument quoting without altering its embedded double quotes.
+    Invoke-Native $node.Path @('-e', "eval(Buffer.from(process.argv[1],'base64').toString('utf8'))", $Config.nodeEngineCheck, $Config.nodeEngineRange) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Remote Node $version does not satisfy required range $($Config.nodeEngineRange)." }
+  }
+  $prefix = @($scriptPath)
+  $key = [ordered] @{ executable = $node.Path; arguments = $prefix; nodeEngineRange = $Config.nodeEngineRange } | ConvertTo-Json -Compress
+  return @{ executable = $node.Path; arguments = $prefix; key = $key }
+}
+`;
+
 const LAUNCH = String.raw`
 function Open-LaunchLock {
   $deadline = [DateTime]::UtcNow.AddSeconds($Config.lockWaitSeconds)
@@ -236,7 +269,7 @@ function Open-LaunchLock {
 }
 
 function Test-Ready([int] $Port, [int] $Timeout) {
-  Invoke-Native $Executable @('__ssh-helper', 'wait-ready', $Port, $Timeout, $Config.readyProbeTimeoutMs) | Out-Null
+  Invoke-Runner $Runner @('__ssh-helper', 'wait-ready', $Port, $Timeout, $Config.readyProbeTimeoutMs) | Out-Null
   return $LASTEXITCODE -eq 0
 }
 
@@ -246,8 +279,8 @@ function Start-Server([int] $Port) {
   # The launcher records the actual t3 PID; Windows lets the server retain its
   # redirected file handles after the launcher exits.
   $launchConfig = @{
-    executable = $Executable; home = $T3Home; state = $StateDir
-    port = $Port; runner = $Config.runnerKey; token = [Guid]::NewGuid().ToString('N')
+    runner = $Runner; home = $T3Home; state = $StateDir
+    port = $Port; token = [Guid]::NewGuid().ToString('N')
     lockWaitSeconds = $Config.lockWaitSeconds; readyTimeoutMs = $Config.readyTimeoutMs
     readyProbeTimeoutMs = $Config.readyProbeTimeoutMs
   } | ConvertTo-Json -Compress
@@ -288,23 +321,25 @@ try {
     $pending = [IO.File]::ReadAllText($pendingFile) | ConvertFrom-Json
     if ($pending.token -ne $config.token) { return }
     $registered = $true
-    $arguments = 'serve --host 127.0.0.1 --port ' + $config.port + ' --base-dir "' + $config.home + '"'
-    $server = Start-Process -FilePath $config.executable -ArgumentList $arguments -WorkingDirectory $config.home -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $config.state 'server.log') -RedirectStandardError (Join-Path $config.state 'server.err.log')
+    # The prefix contains only a resolved file path, whose Windows name cannot contain double quotes.
+    $prefix = (@($config.runner.arguments) | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $arguments = $prefix + ' serve --host 127.0.0.1 --port ' + $config.port + ' --base-dir "' + $config.home + '"'
+    $server = Start-Process -FilePath $config.runner.executable -ArgumentList $arguments -WorkingDirectory $config.home -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $config.state 'server.log') -RedirectStandardError (Join-Path $config.state 'server.err.log')
     $serverOwner = @{
       pid = $server.Id; startedAt = $server.StartTime.ToUniversalTime().Ticks.ToString()
-      port = $config.port; runner = $config.runner; token = $config.token
+      port = $config.port; runner = $config.runner.key; token = $config.token
     }
     $owner = $serverOwner | ConvertTo-Json -Compress
     [IO.File]::WriteAllText(($ownerFile + '.next'), $owner, $utf8)
     Move-Item -LiteralPath ($ownerFile + '.next') -Destination $ownerFile -Force
     $runtimeDeadline = [DateTime]::UtcNow.AddMilliseconds($config.readyTimeoutMs)
-    Invoke-Native $config.executable @('__ssh-helper', 'wait-ready', $config.port, $config.readyTimeoutMs, $config.readyProbeTimeoutMs) | Out-Null
+    Invoke-Runner $config.runner @('__ssh-helper', 'wait-ready', $config.port, $config.readyTimeoutMs, $config.readyProbeTimeoutMs) | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Remote T3 server did not become ready.' }
     # HTTP can answer before the discovery record is published. Keep aliases
     # serialized until they can discover this exact server through its home.
     $runtimeFile = Join-Path $config.home 'userdata/server-runtime.json'
     while ($true) {
-      $runtime = Invoke-Native $config.executable @('__ssh-helper', 'runtime-port', $runtimeFile)
+      $runtime = Invoke-Runner $config.runner @('__ssh-helper', 'runtime-port', $runtimeFile)
       if ($LASTEXITCODE -eq 0 -and $runtime -eq ("$($server.Id) $($config.port)")) { break }
       if ($server.HasExited) { throw 'Remote T3 server exited before publishing its runtime record.' }
       if ([DateTime]::UtcNow -ge $runtimeDeadline) { throw 'Remote T3 server did not publish its runtime record.' }
@@ -384,7 +419,7 @@ function Wait-Server($Launch) {
 }
 
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-$Executable = Install-Runtime
+$Runner = Resolve-Runner
 # Serialize across aliases/clients sharing the default server home, including
 # disconnects, so a second launch observes the first server's runtime record.
 $launchLock = Open-LaunchLock
@@ -392,7 +427,7 @@ try {
   $owner = Read-Owner
   $ownedProcess = Get-OwnedProcess $owner
   $runtimeFile = Join-Path $T3Home 'userdata/server-runtime.json'
-  $runtime = Invoke-Native $Executable @('__ssh-helper', 'runtime-port', $runtimeFile)
+  $runtime = Invoke-Runner $Runner @('__ssh-helper', 'runtime-port', $runtimeFile)
   if ($LASTEXITCODE -eq 0 -and $runtime -match '^(\d+) (\d+)$') {
     $runtimePid = [int] $Matches[1]
     $runtimePort = [int] $Matches[2]
@@ -402,12 +437,12 @@ try {
       return
     }
   }
-  if ($ownedProcess -and -not (Test-Path -LiteralPath $StopFile) -and -not (Test-Path -LiteralPath $LauncherFile) -and $owner.runner -eq $Config.runnerKey -and (Test-Ready $owner.port $Config.reuseReadyTimeoutMs)) {
+  if ($ownedProcess -and -not (Test-Path -LiteralPath $StopFile) -and -not (Test-Path -LiteralPath $LauncherFile) -and $owner.runner -eq $Runner.key -and (Test-Ready $owner.port $Config.reuseReadyTimeoutMs)) {
     @{ remotePort = [int] $owner.port; serverKind = 'managed' } | ConvertTo-Json -Compress
     return
   }
   Stop-OwnedServer
-  $portText = Invoke-Native $Executable @('__ssh-helper', 'pick-port', $PortFile, $Config.defaultPort, $Config.portScanWindow)
+  $portText = Invoke-Runner $Runner @('__ssh-helper', 'pick-port', $PortFile, $Config.defaultPort, $Config.portScanWindow)
   if ($LASTEXITCODE -ne 0) { throw 'Failed to find an available port on the remote host.' }
   $remotePort = [int] $portText
   [IO.File]::WriteAllText($PortFile, $portText, $Utf8)
@@ -463,13 +498,19 @@ export function buildWindowsRemoteScript(
 ) {
   const runner =
     operation === "launch" || operation === "pair" ? resolveRemoteRunner(runnerOptions) : undefined;
-  if (runner?.nodeScriptPath) {
-    return "throw 'Windows SSH source-checkout runners are not supported yet. Use a released desktop build.'";
-  }
   const config = NodeBuffer.Buffer.from(
     JSON.stringify({
       stateKey,
       ...runner,
+      ...(runner?.nodeScriptPath
+        ? {
+            nodeEngineRange: runnerOptions?.nodeEngineRange?.trim() || "",
+            nodeEngineCheck: NodeBuffer.Buffer.from(
+              buildRemoteNodeEngineCheckScript(),
+              "utf8",
+            ).toString("base64"),
+          }
+        : {}),
       runnerKey: runner && JSON.stringify(runner),
       defaultPort: DEFAULT_REMOTE_PORT,
       portScanWindow: REMOTE_PORT_SCAN_WINDOW,
@@ -486,15 +527,16 @@ export function buildWindowsRemoteScript(
   const header = `$Config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${config}')) | ConvertFrom-Json\n`;
   switch (operation) {
     case "launch":
-      return header + COMMON + INSTALL + LAUNCH;
+      return header + COMMON + INSTALL + RESOLVE_RUNNER + LAUNCH;
     case "pair":
       return (
         header +
         COMMON +
         INSTALL +
+        RESOLVE_RUNNER +
         `
-$Executable = Install-Runtime
-Invoke-Native $Executable @('auth', 'pairing', 'create', '--base-dir', $T3Home, '--json')
+$Runner = Resolve-Runner
+Invoke-Runner $Runner @('auth', 'pairing', 'create', '--base-dir', $T3Home, '--json')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 `
       );

@@ -1,8 +1,9 @@
 import { cliReleaseDownloadBaseUrl } from "@t3tools/shared/cliRelease";
+import { satisfiesSemverRange } from "@t3tools/shared/semver";
 import * as Schema from "effect/Schema";
 
 export interface RemoteT3RunnerOptions {
-  /** Dev mode: run an existing source entry point through remote Node (POSIX only). */
+  /** Dev mode: run an existing source entry point through remote Node. */
   readonly nodeScriptPath?: string | null;
   readonly nodeEngineRange?: string | null;
   /** Exact self-contained release version; required unless nodeScriptPath is set. */
@@ -47,4 +48,23 @@ export function resolveRemoteRunner(input?: RemoteT3RunnerOptions) {
     "",
   );
   return { nodeScriptPath, archiveVersion, releaseBaseUrl };
+}
+
+const remoteNodeEngineCheckMain = function remoteNodeEngineCheckMain(
+  satisfiesRange: typeof satisfiesSemverRange,
+) {
+  const range = process.argv[2] || "";
+  const rawVersion =
+    process.versions && process.versions.node ? process.versions.node : process.version;
+
+  if (!satisfiesRange(rawVersion, range)) {
+    process.stderr.write(
+      "Remote node " + rawVersion + " does not satisfy required range " + range + ".\n",
+    );
+    process.exit(1);
+  }
+};
+
+export function buildRemoteNodeEngineCheckScript(): string {
+  return `(${remoteNodeEngineCheckMain.toString()})(${satisfiesSemverRange.toString()});`;
 }

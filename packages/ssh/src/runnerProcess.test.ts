@@ -66,7 +66,12 @@ server.listen(Number(process.env.T3_TEST_PORT ?? 0), "127.0.0.1", () => {
                 },
                 detached: false,
                 stdin: Stream.make(
-                  new TextEncoder().encode(buildRemoteT3RunnerScript({ nodeScriptPath: cliPath })),
+                  new TextEncoder().encode(
+                    buildRemoteT3RunnerScript({
+                      nodeScriptPath: cliPath,
+                      nodeEngineRange: `^${process.versions.node}`,
+                    }),
+                  ),
                 ),
               }),
             );

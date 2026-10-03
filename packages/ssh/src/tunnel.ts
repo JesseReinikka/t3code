@@ -8,7 +8,6 @@ import {
 } from "@t3tools/shared/httpReadiness";
 import * as NetService from "@t3tools/shared/Net";
 import { extractJsonObject, fromLenientJson } from "@t3tools/shared/schemaJson";
-import { satisfiesSemverRange } from "@t3tools/shared/semver";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -61,7 +60,11 @@ import {
   REMOTE_REUSE_READY_TIMEOUT_MS,
   SSH_READY_PROBE_TIMEOUT_MS,
 } from "./remoteLimits.ts";
-import { resolveRemoteRunner, type RemoteT3RunnerOptions } from "./remoteRunner.ts";
+import {
+  buildRemoteNodeEngineCheckScript,
+  resolveRemoteRunner,
+  type RemoteT3RunnerOptions,
+} from "./remoteRunner.ts";
 import { detectRemoteShell, powerShellCommand, type RemoteShell } from "./remoteShell.ts";
 import { buildWindowsRemoteScript, WINDOWS_STOP_TIMEOUT_MS } from "./windowsRemote.ts";
 
@@ -196,24 +199,6 @@ const decodeRemoteLaunchOutput = (stdout: string) =>
 
 const decodeRemotePairingOutput = (stdout: string) =>
   decodeRemoteJsonOutput(stdout, decodeRemotePairingResult);
-
-const remoteNodeEngineCheckMain = function remoteNodeEngineCheckMain() {
-  const range = process.argv[2] || "";
-  const rawVersion =
-    process.versions && process.versions.node ? process.versions.node : process.version;
-
-  if (!satisfiesSemverRange(rawVersion, range)) {
-    process.stderr.write(
-      "Remote node " + rawVersion + " does not satisfy required range " + range + ".\n",
-    );
-    process.exit(1);
-  }
-};
-
-function buildRemoteNodeEngineCheckScript(): string {
-  return `${satisfiesSemverRange.toString()}
-(${remoteNodeEngineCheckMain.toString()})();`;
-}
 
 function normalizeSshErrorMessage(stderr: string, fallbackMessage: string): string {
   const cleaned = stderr.trim();

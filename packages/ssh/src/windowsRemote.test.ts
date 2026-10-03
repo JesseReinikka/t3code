@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
+import type { RemoteT3RunnerOptions } from "./remoteRunner.ts";
 import { powerShellCommand } from "./remoteShell.ts";
 import { buildWindowsRemoteScript } from "./windowsRemote.ts";
 
@@ -62,14 +63,6 @@ describe.skipIf(!available)("PowerShell transport", () => {
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout.trim()).toBe(value);
   });
-
-  it("rejects Windows development runners before creating state", async () => {
-    const result = await runPowerShell(
-      buildWindowsRemoteScript(stateKey, "launch", { nodeScriptPath: "C:\\src\\bin.mjs" }),
-    );
-    expect(result.code).toBe(1);
-    expect(result.stderr).toContain("source-checkout runners are not supported yet");
-  });
 });
 
 // These execute the actual installer and lifecycle script in PowerShell on
@@ -82,13 +75,15 @@ describe.skipIf(!available || HostProcessPlatform.defaultValue() !== "linux")(
     let state: string;
     let versions: string;
     let fixture: string;
+    let sourceRunner: RemoteT3RunnerOptions & { nodeScriptPath: string };
+    let nodeDirectory: string;
     let env: NodeJS.ProcessEnv;
     let spawnedServerPids: Set<number>;
     let stateKeys: Set<string>;
 
     const runOperation = async (
       operation: "launch" | "pair" | "stop" | "logs",
-      options = runner,
+      options: RemoteT3RunnerOptions = runner,
       connectionKey = stateKey,
     ) => {
       stateKeys.add(connectionKey);
@@ -194,6 +189,19 @@ else { process.exitCode = 2; }
 `,
       );
       await NodeFSP.chmod(binary, 0o755);
+      const sourcePath = NodePath.join(root, "checkout O'Neil ä", "bin.cjs");
+      await NodeFSP.mkdir(NodePath.dirname(sourcePath), { recursive: true });
+      await NodeFSP.copyFile(binary, sourcePath);
+      nodeDirectory = NodePath.join(root, "node O'Neil ä");
+      await NodeFSP.mkdir(nodeDirectory);
+      await NodeFSP.symlink(process.execPath, NodePath.join(nodeDirectory, "node.exe"));
+      env.PATH = nodeDirectory + NodePath.delimiter + process.env.PATH;
+      sourceRunner = {
+        ...runner,
+        nodeScriptPath: sourcePath,
+        nodeEngineRange: `^${process.versions.node} || >=999.0.0`,
+      };
+
       const zip = NodePath.join(root, `t3-${version}-win32-x64.zip`);
       const packed = await runPowerShell(
         `Compress-Archive -LiteralPath ${quote(stage)} -DestinationPath ${quote(zip)}`,
@@ -291,6 +299,104 @@ function Invoke-CimMethod($ClassName, $MethodName, $Arguments) {
       ]);
     });
 
+    it.each(["node", "script", "engine"])(
+      "rejects a missing or incompatible source-runner prerequisite: %s",
+      async (prerequisite) => {
+        let options = sourceRunner;
+        let diagnostic: string;
+        if (prerequisite === "node") {
+          await NodeFSP.unlink(NodePath.join(nodeDirectory, "node.exe"));
+          diagnostic = "Remote node.exe was not found on the SSH session PATH";
+        } else if (prerequisite === "script") {
+          options = { ...sourceRunner, nodeScriptPath: NodePath.join(root, "missing.cjs") };
+          diagnostic = "Remote Node script does not exist";
+        } else {
+          options = { ...sourceRunner, nodeEngineRange: ">=999.0.0" };
+          diagnostic = "does not satisfy required range >=999.0.0";
+        }
+        for (const operation of ["launch", "pair"] as const) {
+          const failed = await runOperation(operation, options);
+          expect(failed.code).toBe(1);
+          expect(failed.stderr).toContain(diagnostic);
+        }
+        await expect(NodeFSP.stat(NodePath.join(root, "calls"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(NodeFSP.stat(NodePath.join(root, "downloads"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      },
+    );
+
+    it("starts, pairs, reuses, logs, and stops a source runner with quoted paths without downloading", async () => {
+      const launched = await runOperation("launch", sourceRunner);
+      expect(launched.code, launched.stderr).toBe(0);
+      expect(JSON.parse(launched.stdout).serverKind).toBe("managed");
+      const ownerPath = NodePath.join(state, "owner.json");
+      const owner = JSON.parse(await NodeFSP.readFile(ownerPath, "utf8"));
+      expect(JSON.parse(owner.runner)).toMatchObject({
+        executable: NodePath.join(nodeDirectory, "node.exe"),
+        arguments: [sourceRunner.nodeScriptPath],
+      });
+      const paired = await runOperation("pair", sourceRunner);
+      expect(paired.code, paired.stderr).toBe(0);
+      expect(JSON.parse(paired.stdout)).toEqual({ credential: "fixture-token" });
+      // Release configuration is irrelevant when the source runner takes precedence.
+      const reused = await runOperation("launch", { ...sourceRunner, archiveVersion: "9.9.9" });
+      expect(reused.code, reused.stderr).toBe(0);
+      expect(JSON.parse(await NodeFSP.readFile(ownerPath, "utf8")).pid).toBe(owner.pid);
+      const logs = await runOperation("logs", sourceRunner);
+      expect(logs.code, logs.stderr).toBe(0);
+      expect(logs.stdout).toContain("fixture server ready");
+      const calls = (await NodeFSP.readFile(NodePath.join(root, "calls"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(calls.filter((args) => args[0] === "auth")).toEqual([
+        ["auth", "pairing", "create", "--base-dir", NodePath.join(root, ".t3"), "--json"],
+      ]);
+      expect(calls.filter((args) => args[0] === "serve")).toHaveLength(1);
+      await expect(NodeFSP.stat(NodePath.join(root, "downloads"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(NodeFSP.stat(versions)).rejects.toMatchObject({ code: "ENOENT" });
+      // Shutdown must not require the checkout or Node to still exist.
+      await NodeFSP.unlink(sourceRunner.nodeScriptPath);
+      await NodeFSP.unlink(NodePath.join(nodeDirectory, "node.exe"));
+      const stopped = await runOperation("stop", sourceRunner);
+      expect(stopped.code, stopped.stderr).toBe(0);
+      expect(() => process.kill(owner.pid, 0)).toThrow();
+      await expect(NodeFSP.stat(ownerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("replaces managed runners when the script, Node executable, or runner mode changes", async () => {
+      const ownerPath = NodePath.join(state, "owner.json");
+      let previousPid: number | undefined;
+      const launchReplacement = async (options: RemoteT3RunnerOptions) => {
+        const result = await runOperation("launch", options);
+        expect(result.code, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout).serverKind).toBe("managed");
+        const owner = JSON.parse(await NodeFSP.readFile(ownerPath, "utf8"));
+        if (previousPid !== undefined) {
+          expect(owner.pid).not.toBe(previousPid);
+          expect(() => process.kill(previousPid!, 0)).toThrow();
+        }
+        previousPid = owner.pid;
+      };
+      await launchReplacement(sourceRunner);
+      const nextScript = NodePath.join(root, "next checkout ä.cjs");
+      await NodeFSP.copyFile(sourceRunner.nodeScriptPath, nextScript);
+      const nextRunner = { ...sourceRunner, nodeScriptPath: nextScript };
+      await launchReplacement(nextRunner);
+      const nextNodeDirectory = NodePath.join(root, "next node");
+      await NodeFSP.mkdir(nextNodeDirectory);
+      await NodeFSP.symlink(process.execPath, NodePath.join(nextNodeDirectory, "node.exe"));
+      env.PATH = nextNodeDirectory + NodePath.delimiter + process.env.PATH;
+      await launchReplacement(nextRunner);
+      await launchReplacement(runner);
+      await launchReplacement(nextRunner);
+    });
+
     it("cleans an invalid download and retries successfully", async () => {
       const sums = NodePath.join(root, "SHA256SUMS");
       const valid = await NodeFSP.readFile(sums, "utf8");
@@ -330,25 +436,30 @@ function Invoke-CimMethod($ClassName, $MethodName, $Arguments) {
       expect(() => process.kill(nextOwner.pid, 0)).toThrow();
     });
 
-    it("reuses an external server and never kills it on disconnect", async () => {
-      const launched = await runOperation("launch");
-      expect(launched.code, launched.stderr).toBe(0);
-      const ownerPath = NodePath.join(state, "owner.json");
-      const owner = await NodeFSP.readFile(ownerPath, "utf8");
-      await expect(NodeFSP.stat(NodePath.join(state, "launcher.json"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      await NodeFSP.unlink(ownerPath);
-      try {
-        const external = await runOperation("launch");
-        expect(external.code, external.stderr).toBe(0);
-        expect(JSON.parse(external.stdout).serverKind).toBe("external");
-        expect((await runOperation("stop")).code).toBe(0);
-        expect(() => process.kill(JSON.parse(owner).pid, 0)).not.toThrow();
-      } finally {
-        await NodeFSP.writeFile(ownerPath, owner);
-      }
-    });
+    it.each(["release", "source"])(
+      "reuses an external server and never kills it on disconnect (%s)",
+      async (mode) => {
+        const options =
+          mode === "source" ? { nodeScriptPath: sourceRunner.nodeScriptPath } : runner;
+        const launched = await runOperation("launch", options);
+        expect(launched.code, launched.stderr).toBe(0);
+        const ownerPath = NodePath.join(state, "owner.json");
+        const owner = await NodeFSP.readFile(ownerPath, "utf8");
+        await expect(NodeFSP.stat(NodePath.join(state, "launcher.json"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await NodeFSP.unlink(ownerPath);
+        try {
+          const external = await runOperation("launch", options);
+          expect(external.code, external.stderr).toBe(0);
+          expect(JSON.parse(external.stdout).serverKind).toBe("external");
+          expect((await runOperation("stop")).code).toBe(0);
+          expect(() => process.kill(JSON.parse(owner).pid, 0)).not.toThrow();
+        } finally {
+          await NodeFSP.writeFile(ownerPath, owner);
+        }
+      },
+    );
 
     it("serializes concurrent launches for the same SSH connection", async () => {
       const results = await Promise.all([runOperation("launch"), runOperation("launch")]);
