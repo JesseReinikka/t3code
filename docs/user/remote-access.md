@@ -164,15 +164,25 @@ In the desktop app, open **Settings → Connections → Add environment**, choos
 or reuses a server there and opens the port forward for you. Projects, provider
 credentials, and agent work stay on the remote machine.
 
-The remote host must be Linux or an Apple Silicon Mac with `curl` or `wget`,
-`tar`, `sha256sum` or `shasum`, and [provider setup](./install.md#providers).
+The remote host needs [provider setup](./install.md#providers) and either:
+
+- Linux or an Apple Silicon Mac with `curl` or `wget`, `tar`, and `sha256sum` or `shasum`.
+- Windows x64 or ARM64 with OpenSSH Server and Windows PowerShell 5.1. T3 Code
+  invokes PowerShell automatically; the SSH default shell can remain Command Prompt.
+
 The first launch downloads T3 Code's server to `~/.t3/runtime` on the host, so
 it takes longer than later ones.
-Provider CLIs must be on the `PATH` of a non-interactive login shell there;
-check with:
+Provider CLIs must be available to non-interactive SSH sessions. On Linux and
+macOS, check with:
 
 ```bash
 ssh user@example.com 'sh -lc "command -v claude codex"'
+```
+
+On Windows, check with:
+
+```bash
+ssh user@example.com 'powershell.exe -NoProfile -Command "Get-Command claude,codex -ErrorAction SilentlyContinue"'
 ```
 
 If SSH reconnecting fails after an app update, retry the launch once. Removing
