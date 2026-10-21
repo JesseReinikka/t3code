@@ -67,7 +67,12 @@ server.listen(Number(process.env.T3_TEST_PORT ?? 0), "127.0.0.1", () => {
                 },
                 detached: false,
                 stdin: Stream.make(
-                  new TextEncoder().encode(buildRemoteT3RunnerScript({ nodeScriptPath: cliPath })),
+                  new TextEncoder().encode(
+                    buildRemoteT3RunnerScript({
+                      nodeScriptPath: cliPath,
+                      nodeEngineRange: `^${process.versions.node}`,
+                    }),
+                  ),
                 ),
               }),
             );
@@ -202,7 +207,7 @@ server.listen(0, "127.0.0.1", () => {
             const stop = yield* spawner.spawn(
               ChildProcess.make("/bin/sh", ["-s"], {
                 cwd: fixture,
-                env: { T3_TEST_STATE_DIR: fixture },
+                env: { PATH: process.env.PATH ?? "", T3_TEST_STATE_DIR: fixture },
                 stdin: Stream.make(new TextEncoder().encode(isolatedScript)),
               }),
             );

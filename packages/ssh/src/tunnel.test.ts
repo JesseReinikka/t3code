@@ -213,7 +213,6 @@ describe("ssh tunnel scripts", () => {
     assert.include(script, `T3_NODE_ENGINE_RANGE='${TEST_NODE_ENGINE_RANGE}'`);
     assert.include(script, "remote_node_satisfies_engine()");
     assert.include(script, "function satisfiesSemverRange");
-    assert.include(script, "satisfiesSemverRange(rawVersion, range)");
     assert.include(script, 'prepend_path_if_dir "/home/linuxbrew/.linuxbrew/bin"');
     assert.include(script, 'prepend_path_if_dir "$VOLTA_HOME/bin"');
     assert.include(script, 'prepend_path_if_dir "$HOME/.asdf/shims"');
@@ -329,7 +328,12 @@ describe("ssh tunnel scripts", () => {
     const layerProcess = Layer.merge(NodeServices.layer, layerSpawner);
 
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE);
+      const result = yield* SshTunnel.launchOrReuseRemoteServer(
+        target,
+        undefined,
+        ARCHIVE,
+        "posix",
+      );
       assert.equal(result.remotePort, 3774);
       assert.deepEqual(spawnedCommands[0]?.slice(-5, -1), ["sh", "-l", "-s", "--"]);
     }).pipe(Effect.provide(layerProcess));
@@ -350,7 +354,7 @@ describe("ssh tunnel scripts", () => {
 
     return Effect.gen(function* () {
       const fiber = yield* Effect.forkChild(
-        SshTunnel.launchOrReuseRemoteServer(target, undefined, NODE_SCRIPT),
+        SshTunnel.launchOrReuseRemoteServer(target, undefined, NODE_SCRIPT, "posix"),
       );
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(75));
@@ -375,7 +379,7 @@ describe("ssh tunnel scripts", () => {
 
     return Effect.gen(function* () {
       const fiber = yield* Effect.forkChild(
-        SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE),
+        SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE, "posix"),
       );
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(800));
@@ -456,7 +460,7 @@ describe("ssh tunnel scripts", () => {
     const layerSpawner = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
     const layerProcess = Layer.merge(NodeServices.layer, layerSpawner);
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE);
+      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, "posix");
       assert.equal(result.credential, "LCL4R2TPHDKQ");
     }).pipe(Effect.provide(layerProcess));
   });
@@ -484,7 +488,7 @@ describe("ssh tunnel scripts", () => {
     const layerSpawner = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
     const layerProcess = Layer.merge(NodeServices.layer, layerSpawner);
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE);
+      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, "posix");
       assert.equal(result.credential, "LCL4R2TPHDKQ");
     }).pipe(Effect.provide(layerProcess));
   });
@@ -553,6 +557,7 @@ describe("ssh tunnel scripts", () => {
         Effect.sync(() => {
           const args = commandArgs(command);
           spawnedCommands.push(args);
+          assert.notInclude(args, "uname");
           if (args.includes("-N")) {
             return makeRunningProcess(() => {
               tunnelKillCount += 1;
@@ -597,6 +602,8 @@ describe("ssh tunnel scripts", () => {
 
         const first = yield* manager.ensureEnvironment(target);
         assert.equal(first.httpBaseUrl, "http://127.0.0.1:41773/");
+        // One bootstrap connection plus the tunnel; no separate shell probe.
+        assert.equal(spawnedCommands.filter((args) => !args.includes("-G")).length, 2);
         const firstTunnelArgs = spawnedCommands.find((args) => args.includes("-N"));
         assert.isDefined(firstTunnelArgs);
         assert.include(firstTunnelArgs, "ControlMaster=no");
@@ -894,6 +901,7 @@ describe("ssh tunnel scripts", () => {
           Effect.gen(function* () {
             const args = commandArgs(command);
             const isTarget = args.includes(target.alias);
+            assert.notInclude(args, "uname");
             if (args.includes("-G")) {
               if (isTarget && ++resolutions === 4) {
                 yield* Deferred.succeed(reconnectsStarted, undefined);
@@ -976,6 +984,88 @@ describe("ssh tunnel scripts", () => {
         );
       }),
   );
+
+  it.effect("uses the detected Windows shell for launch, pairing, reconnect, and cleanup", () => {
+    let probes = 0;
+    let launches = 0;
+    let stops = 0;
+    let tunnelsStopped = 0;
+    const target = { alias: "windows", hostname: "windows", username: null, port: null };
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const args = commandArgs(command);
+        if (args.includes("-G")) return makeSuccessfulProcess("");
+        if (args.includes("-N"))
+          return makeRunningProcess(() => {
+            tunnelsStopped += 1;
+          });
+        assert.notInclude(args, "uname");
+        if (args.includes("sh"))
+          return {
+            ...makeSuccessfulProcess(""),
+            stderr: Stream.make(new TextEncoder().encode("sh is not recognized")),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+          };
+        assert.include(args, "powershell.exe");
+        assert.notInclude(args, "sh");
+        const stdin = command._tag === "StandardCommand" ? command.options.stdin : undefined;
+        if (
+          typeof stdin !== "object" ||
+          stdin === null ||
+          !("stream" in stdin) ||
+          !Stream.isStream(stdin.stream)
+        ) {
+          throw new Error("Expected a script on stdin");
+        }
+        const script = yield* stdin.stream.pipe(
+          Stream.decodeText(),
+          Stream.runFold(
+            () => "",
+            (text, chunk) => text + chunk,
+          ),
+        );
+        if (script.includes("T3_SSH_WINDOWS")) {
+          probes += 1;
+          return makeSuccessfulProcess("T3_SSH_WINDOWS\r\n");
+        }
+        if (script.includes("'auth', 'pairing', 'create'")) {
+          return makeSuccessfulProcess('{"credential":"windows-token"}\r\n');
+        }
+        if (script.includes("serverKind = 'managed'")) {
+          launches += 1;
+          return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\r\n');
+        }
+        stops += 1;
+        return makeSuccessfulProcess('{"stopped":true}\r\n');
+      }),
+    );
+    const layer = Layer.mergeAll(
+      NodeServices.layer,
+      Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Layer.succeed(HttpClient.HttpClient, testHttpClient),
+      Layer.succeed(NetService.NetService, testNetService),
+      SshAuth.SshPasswordPrompt.disabledLayer,
+      SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+    );
+    return Effect.gen(function* () {
+      const manager = yield* SshTunnel.SshEnvironmentManager;
+      const first = yield* manager.ensureEnvironment(target, { issuePairingToken: true });
+      assert.equal(first.pairingToken, "windows-token");
+      assert.equal(first.remoteServerKind, "managed");
+      const second = yield* manager.ensureEnvironment(target);
+      assert.equal(second.httpBaseUrl, first.httpBaseUrl);
+      assert.equal(probes, 1);
+      assert.equal(launches, 1);
+      yield* manager.disconnectEnvironment(target);
+      assert.equal(stops, 1);
+      assert.equal(tunnelsStopped, 1);
+      assert.equal(probes, 1);
+      // Removing a saved environment without a tunnel reuses the detected shell.
+      yield* manager.disconnectEnvironment(target);
+      assert.equal(probes, 1);
+      assert.equal(stops, 2);
+    }).pipe(Effect.provide(layer), Effect.scoped);
+  });
 });
 
 // On macOS, Node can bind 127.0.0.1:<port> while another process (such as the
