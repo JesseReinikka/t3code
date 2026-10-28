@@ -73,6 +73,16 @@ Read ports from the `[dev-runner]` output. Worktrees derive stable preferences f
 but occupied ports can shift them. `T3CODE_PORT_OFFSET` or `T3CODE_DEV_INSTANCE` can select a
 different preference when needed.
 
+### SSH with a remote checkout
+
+Before starting `vp run dev:desktop`, set `T3CODE_DEV_REMOTE_T3_SERVER_ENTRY_PATH`
+on the client machine to the runnable server entry point in an existing remote
+checkout, such as `C:\src\t3code\apps\server\dist\bin.mjs` on Windows.
+Desktop SSH connections then use that entry point instead of downloading a server
+release. On Windows, `node.exe` must be on the non-interactive SSH session's PATH
+and satisfy the server's Node version requirement. T3 Code does not install Node
+or the checkout. This setting applies only to development desktop builds.
+
 ### Sharing and remote debugging
 
 `vp run dev --share` publishes the web port over the machine's tailnet and prints a pairing URL
