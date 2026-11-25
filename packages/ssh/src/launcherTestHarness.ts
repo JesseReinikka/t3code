@@ -45,6 +45,8 @@ export const captureLauncherFor = Effect.fn("test.captureLauncher")(function* (
     { alias: "test", hostname: "test.invalid", username: null, port: null },
     undefined,
     runner,
+    undefined,
+    "posix",
   ).pipe(
     Effect.provide(
       Layer.mergeAll(
@@ -167,7 +169,7 @@ fi`,
   printf '/bin/sh %s/.t3/ssh-launch/test-target/run-t3.sh serve --host 127.0.0.1 --port 5999\\n' "$HOME"
   exit 0
 fi
-PATH=/usr/bin:/bin exec ps "$@"`,
+PATH="$TEST_REAL_PATH" exec ps "$@"`,
     );
     if (options.recordedKind) {
       const state = NodePath.join(home, ".t3/ssh-launch/test-target");
@@ -226,7 +228,8 @@ ${script}`,
       env: {
         ...process.env,
         HOME: home,
-        PATH: `${bin}:/usr/bin:/bin`,
+        PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+        TEST_REAL_PATH: process.env.PATH ?? "/usr/bin:/bin",
         TEST_REAL_NODE: process.execPath,
         TEST_CLEAR_MARKER: options.clearMarkerOnReady ? "1" : "0",
         TEST_CLOCK_JUMP: options.clockJump === undefined ? "" : String(options.clockJump),

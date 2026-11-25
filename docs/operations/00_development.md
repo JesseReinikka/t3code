@@ -45,6 +45,16 @@ With `origin` on the mirror, use `src` instead of `gh`. PRs into `main` still me
 - **Sharing:** `vp run dev --share` exposes the web port over Tailscale and prints a pairing URL. Add `--built` to serve `apps/web/dist` via `vp build --watch` (no HMR, faster over slow links). Never set `VITE_HTTP_URL` or `VITE_WS_URL` in dev—Vite proxies `/api` and `/ws` single-origin.
 - **Startup profiling:** `vp run profile:startup` captures the first 20 s of Node processes under `.t3/startup-profiles/<timestamp>`.
 
+### SSH with a remote checkout
+
+Before starting `vp run dev:desktop`, set `T3CODE_DEV_REMOTE_T3_SERVER_ENTRY_PATH`
+on the client machine to the runnable server entry point in an existing remote
+checkout, such as `C:\src\t3code\apps\server\dist\bin.mjs` on Windows.
+Desktop SSH connections then use that entry point instead of downloading a server
+release. On Windows, `node.exe` must be on the non-interactive SSH session's PATH
+and satisfy the server's Node version requirement. T3 Code does not install Node
+or the checkout. This setting applies only to development desktop builds.
+
 ### Replay provider
 
 `vp run dev` registers `Replay (dev)` ([dev-replay-agent.ts](../../apps/server/scripts/dev-replay-agent.ts)), a local ACP agent that streams recorded transcripts without calling a paid model. Add scenarios under `SCENARIOS` pointing at a generic ACP fixture (`registry_transcript.ndjson`) or a file in `apps/server/scripts/dev-replay`.

@@ -11,6 +11,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NetService from "@t3tools/shared/Net";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -511,7 +512,13 @@ describe("ssh tunnel scripts", () => {
     );
 
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE);
+      const result = yield* SshTunnel.launchOrReuseRemoteServer(
+        target,
+        undefined,
+        ARCHIVE,
+        undefined,
+        "posix",
+      );
       assert.equal(result.remotePort, 3774);
     }).pipe(Effect.provide(layerProcess));
   });
@@ -526,7 +533,7 @@ describe("ssh tunnel scripts", () => {
         const bash = `${directory}/bash`;
         // System profiles can reset HOME. Suppress profile reads while BASH_ENV
         // checks that the launcher still requests Bash login mode.
-        yield* fs.writeFileString(bash, '#!/bin/sh\nexec /bin/bash --noprofile "$@"\n');
+        yield* fs.writeFileString(bash, '#!/bin/sh\nexec bash --noprofile "$@"\n');
         yield* fs.chmod(bash, 0o755);
         yield* fs.writeFileString(
           startupFile,
@@ -544,7 +551,7 @@ describe("ssh tunnel scripts", () => {
         yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, capture),
         );
-        yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE).pipe(
+        yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, "posix").pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, capture),
         );
         yield* fs.writeFileString(
@@ -654,7 +661,7 @@ describe("ssh tunnel scripts", () => {
       layerSpawner,
     );
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE);
+      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, "posix");
       assert.equal(result.credential, "LCL4R2TPHDKQ");
     }).pipe(Effect.provide(layerProcess));
   });
@@ -1124,6 +1131,7 @@ describe("ssh tunnel scripts", () => {
           Effect.gen(function* () {
             const args = commandArgs(command);
             const isTarget = args.includes(target.alias);
+            assert.notInclude(args, "uname");
             if (args.includes("-G")) {
               if (isTarget && ++resolutions === 4) {
                 yield* Deferred.succeed(reconnectsStarted, undefined);
@@ -1209,15 +1217,20 @@ describe("ssh tunnel scripts", () => {
   );
 
   it.effect.each([
-    { name: "rides a live ControlMaster", masterLive: true },
-    { name: "keeps the auth failure without a live ControlMaster", masterLive: false },
-  ])("when the tunnel cannot sign in again, $name", ({ masterLive }) =>
+    { name: "rides a live ControlMaster", masterLive: true, windows: false },
+    { name: "rides a live ControlMaster on Windows", masterLive: true, windows: true },
+    {
+      name: "keeps the auth failure without a live ControlMaster",
+      masterLive: false,
+      windows: false,
+    },
+  ])("when the tunnel cannot sign in again, $name", ({ masterLive, windows }) =>
     Effect.gen(function* () {
       const denied = "julius@devbox: Permission denied (publickey,keyboard-interactive).\n";
       const openedForwards: Array<string | undefined> = [];
       const cancelledForwards: Array<string | undefined> = [];
       const spawner = ChildProcessSpawner.make((command) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           const args = commandArgs(command);
           const forward = args.includes("-L") ? args[args.indexOf("-L") + 1] : undefined;
           const muxCommand = args.includes("-O") ? args[args.indexOf("-O") + 1] : undefined;
@@ -1241,10 +1254,37 @@ describe("ssh tunnel scripts", () => {
           if (forward !== undefined) {
             // Only the signed-in master can pass the host's one-time-code prompt.
             if (!masterLive || args.includes("ControlPath=none")) return failed(denied);
+            if (windows && !args.at(-1)?.startsWith("powershell.exe ")) {
+              return failed("sh is not recognised on this Windows host");
+            }
             openedForwards.push(forward);
             return muxCommand === "forward"
               ? makeSuccessfulProcess("")
               : makeRunningProcess(() => undefined);
+          }
+          if (windows && args.includes("sh")) {
+            return failed(
+              "'sh' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n",
+            );
+          }
+          if (windows && args.includes("-EncodedCommand")) {
+            const stdin = command._tag === "StandardCommand" ? command.options.stdin : undefined;
+            if (
+              typeof stdin !== "object" ||
+              stdin === null ||
+              !("stream" in stdin) ||
+              !Stream.isStream(stdin.stream)
+            ) {
+              throw new Error("Expected a script on stdin");
+            }
+            const script = yield* stdin.stream.pipe(
+              Stream.decodeText(),
+              Stream.runFold(
+                () => "",
+                (text, chunk) => text + chunk,
+              ),
+            );
+            if (script.includes("T3_SSH_WINDOWS")) return makeSuccessfulProcess("T3_SSH_WINDOWS\n");
           }
           return makeSuccessfulProcess('{"remotePort":3773}\n');
         }),
@@ -1359,6 +1399,88 @@ child.on("exit", (code) => process.exit(code ?? 1));`,
       }).pipe(Effect.scoped),
     ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
+  it.effect("uses the detected Windows shell for launch, pairing, reconnect, and cleanup", () => {
+    let probes = 0;
+    let launches = 0;
+    let stops = 0;
+    let tunnelsStopped = 0;
+    const target = { alias: "windows", hostname: "windows", username: null, port: null };
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const args = commandArgs(command);
+        if (args.includes("-G")) return makeSuccessfulProcess("");
+        if (args.includes("-N"))
+          return makeRunningProcess(() => {
+            tunnelsStopped += 1;
+          });
+        assert.notInclude(args, "uname");
+        if (args.includes("sh"))
+          return {
+            ...makeSuccessfulProcess(""),
+            stderr: Stream.make(new TextEncoder().encode("sh is not recognized")),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+          };
+        assert.include(args, "powershell.exe");
+        assert.notInclude(args, "sh");
+        const stdin = command._tag === "StandardCommand" ? command.options.stdin : undefined;
+        if (
+          typeof stdin !== "object" ||
+          stdin === null ||
+          !("stream" in stdin) ||
+          !Stream.isStream(stdin.stream)
+        ) {
+          throw new Error("Expected a script on stdin");
+        }
+        const script = yield* stdin.stream.pipe(
+          Stream.decodeText(),
+          Stream.runFold(
+            () => "",
+            (text, chunk) => text + chunk,
+          ),
+        );
+        if (script.includes("T3_SSH_WINDOWS")) {
+          probes += 1;
+          return makeSuccessfulProcess("T3_SSH_WINDOWS\r\n");
+        }
+        if (script.includes("'auth', 'pairing', 'create'")) {
+          return makeSuccessfulProcess('{"credential":"windows-token"}\r\n');
+        }
+        if (script.includes("serverKind = 'managed'")) {
+          launches += 1;
+          return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\r\n');
+        }
+        stops += 1;
+        return makeSuccessfulProcess('{"stopped":true}\r\n');
+      }),
+    );
+    const layer = Layer.mergeAll(
+      NodeServices.layer,
+      NodeCrypto.layer,
+      Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Layer.succeed(HttpClient.HttpClient, testHttpClient),
+      Layer.succeed(NetService.NetService, testNetService),
+      SshAuth.SshPasswordPrompt.disabledLayer,
+      SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+    );
+    return Effect.gen(function* () {
+      const manager = yield* SshTunnel.SshEnvironmentManager;
+      const first = yield* manager.ensureEnvironment(target, { issuePairingToken: true });
+      assert.equal(first.pairingToken, "windows-token");
+      assert.equal(first.remoteServerKind, "managed");
+      const second = yield* manager.ensureEnvironment(target);
+      assert.equal(second.httpBaseUrl, first.httpBaseUrl);
+      assert.equal(probes, 1);
+      assert.equal(launches, 1);
+      yield* manager.disconnectEnvironment(target);
+      assert.equal(stops, 1);
+      assert.equal(tunnelsStopped, 1);
+      assert.equal(probes, 1);
+      // Removing a saved environment without a tunnel reuses the detected shell.
+      yield* manager.disconnectEnvironment(target);
+      assert.equal(probes, 1);
+      assert.equal(stops, 2);
+    }).pipe(Effect.provide(layer), Effect.scoped);
+  });
 });
 
 // On Linux kill -0 accepts a thread ID and kill <tid> signals its whole process,
@@ -1795,7 +1917,9 @@ const canBind = (port) =>
   const runScript = (home: string, args: ReadonlyArray<string>) =>
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const child = yield* spawner.spawn(ChildProcess.make("sh", args, { env: { HOME: home } }));
+      const child = yield* spawner.spawn(
+        ChildProcess.make("sh", args, { env: { HOME: home, PATH: yield* Config.String("PATH") } }),
+      );
       const collect = (stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>) =>
         stream.pipe(Stream.decodeText(), Stream.mkString);
       const [stdout, stderr, exitCode] = yield* Effect.all(
